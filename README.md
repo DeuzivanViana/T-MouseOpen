@@ -1,22 +1,40 @@
 # TMouseOpen
 
 Linux configurator for the **Titorion YDX-GM009** mouse (2.4G receiver `04f3:026f`, PAW3311 sensor).
-Shows polling rate, active DPI stage, battery, charge state and sensor; changes the polling rate and the 7 DPI stages.
+Shows polling rate, active DPI stage, battery, charge state, sensor and lighting effect, and changes
+polling rate, DPI stages, button assignment, DPI LED colors, sensor options (angle snap, motion sync,
+ripple control, lift-off), sleep timer, button debounce and lighting, and can restore the factory settings.
 
 ![TMouseOpen main window](docs/screenshot.png)
 
-| Settings applied, log open | Confirming an untested polling rate | No receiver connected |
+| Buttons & LED | Sensor & power (applied, log open) | Lighting |
 |---|---|---|
-| ![applied](docs/screenshot-applied.png) | ![confirm](docs/screenshot-confirm.png) | ![no receiver](docs/screenshot-no-receiver.png) |
+| ![buttons](docs/screenshot-buttons.png) | ![sensor](docs/screenshot-sensor.png) | ![lighting](docs/screenshot-lighting.png) |
+
+| Device and factory reset | Factory reset confirmation | No receiver connected |
+|---|---|---|
+| ![device](docs/screenshot-device.png) | ![reset](docs/screenshot-reset.png) | ![no receiver](docs/screenshot-no-receiver.png) |
 
 *Screenshots taken with `--demo` (simulated mouse) on Xvfb; no hardware was touched.*
 
 ## Interface
 - **Stat tiles** at the top: polling rate (with the receiver's maximum), active DPI and stage, battery level and charge state, sensor and firmware.
-- **Polling rate**: segmented control (125 / 250 / 500 / 1000 Hz). Values marked `*` have not been tested on the mouse yet and ask for confirmation before being sent.
-- **DPI stages**: one row per stage with an on/off switch, a numbered badge (click it to make that stage active), the DPI picker and a bar showing the value relative to the 12000 DPI maximum. Nothing is sent until you press **Apply DPI**.
-- **Device** card: receiver, sensor, firmware and maximum rate; when the mouse is not connected it shows the last applied polling rate.
-- **Status bar**: connection pill in the header, result of the last command in the footer and a collapsible log with every frame sent and acknowledged.
+- **Performance**: polling rate (segmented control: 125 / 250 / 500 / 1000 Hz) and the 7 DPI stages (on/off switch, click a number to make it active, DPI picker, bar relative to 12000 DPI).
+- **Buttons & LED**: function of each of the 6 buttons (left, right, middle, back, forward, DPI loop) and the LED color of each DPI stage.
+- **Sensor & power**: angle snap, motion sync, ripple control, lift-off distance (1/2 mm), sleep timer (1–8 min), LED off while moving and button debounce (0–30 ms).
+- **Lighting**: effect (off, colorful streaming, breathing, steady, neon, snake, colorful steady, wave), speed, brightness and direction; the tile shows the effect the mouse reports.
+- **Device**: receiver details and **Restore factory settings** (two confirmations).
+- **Status bar**: connection pill, result of the last command and a collapsible log with every frame sent and acknowledged.
+
+## Where the commands come from
+The commands beyond polling and DPI were recovered by static reverse engineering of the official
+Windows software (GamingMS v2.1.5, analyzed with [REA](https://github.com/morluto/rea) + Ghidra, never executed)
+and then confirmed on the mouse. See `PROTOCOL.md` for each command's bytes and origin.
+- **Only the official ranges**: values are limited to what the official software itself offers (debounce 0–30 ms, sleep 1–8 min, 3 speed and 4 brightness levels…); anything else is rejected before a frame is built, and unit tests check every frame byte by byte.
+- **Only known button functions**: the 6 functions whose codes are confirmed by the official profiles and the firmware's own default table. At least one button must stay a left click.
+- **Batches stop at the first failure**: if the mouse does not acknowledge a command, the rest of that batch is not sent.
+- **No firmware, pairing or macros**: reports 0xBC/0xBF do not exist in the code, the device layer refuses any command code outside the allowed list, and macro upload (0x10/0x11) is not implemented.
+- **Way back**: Device → Restore factory settings (two confirmations) sends the official "Restore" command.
 
 ## Prebuilt binary (Debian 11, 12, 13)
 Download `tmouseopen-<version>-linux-x86_64.tar.gz`, then:
@@ -85,13 +103,14 @@ The mouse DPI button **only cycles through enabled stages**. Enable every stage 
 Each stage's DPI is picked from a list (100–12000 in steps of 100) and is sent only when you press **Apply DPI**.
 
 ## Reading the current settings
-The mouse has no "read settings" command (the official software doesn't either). The status report arrives every ~5 s
-while the mouse is awake. The mouse does not report the DPI of each stage, so the app stores the last applied values in
+The mouse has no "read settings" command (the official software doesn't either); only the polling rate,
+active DPI stage and lighting effect come back in the status report. The status report arrives every ~5 s
+while the mouse is awake. The mouse does not report the DPI of each stage, so the app stores the last applied values (DPI, buttons, colors, sensor, power, lighting) in
 `~/.config/tmouseopen/state.json` (only after the mouse acknowledges them). On first run, settings from the previous
 version (`~/.config/ydx-mouse/`) are picked up automatically.
 
 ## Security
-- Only the polling (0x04) and DPI (0x02) commands can be built, and writes are restricted to report 0x06. The firmware reports (0xBC/0xBF) do not exist in the code.
+- Only the configuration commands 0x01–0x09 and 0x0F can be built (each with validated values), and writes are restricted to report 0x06; the device layer checks the command code again. The firmware reports (0xBC/0xBF) do not exist in the code.
 - Only `/dev/hidrawN` is opened, and after opening the descriptor itself is checked: character device, VID:PID `04f3:026f` and a 252-byte report descriptor (control interface).
 - Reads use fixed-size buffers and timeouts; invalid commands are rejected before they reach the device.
 - `state.json` is treated as untrusted (size-limited, fully validated) and written atomically with mode 0600, without following symlinks.
@@ -106,5 +125,5 @@ version (`~/.config/ydx-mouse/`) are picked up automatically.
 | `src/worker.rs` | device thread: sends commands, waits for acks, reads status, reconnects |
 | `src/state.rs` | saved settings |
 | `src/privs.rs` | `sudo -E` support: open the receiver, then drop root |
-| `src/ui.rs` | egui UI (dark monochrome theme, stat tiles, segmented control, DPI stage list) |
+| `src/ui.rs` | egui UI (dark monochrome theme, stat tiles, tabs for performance, buttons, sensor, lighting and device) |
 | `PROTOCOL.md` | what is known about the protocol, with confidence levels |

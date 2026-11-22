@@ -40,6 +40,7 @@ Decoded the same way the official software does (`0x433937…`). The software on
 | 3 | polling code [HW] |
 | 4 | battery % [RE + HW: 30% matched] |
 | 5 | 0 = on battery, 1 = charging, 2 = fully charged (the software forces 100%) [RE] |
+| 6 | lighting effect (see command 0x06) [RE] |
 | 7 | profile (0 = none) [RE] |
 | 8 | receiver tier: `02` → up to 1000 Hz; `04` → +2000; `08` → +4000 [RE] |
 | 9 | sensor: `0x11` = PAW3311 [RE + CAP] |
@@ -49,16 +50,27 @@ Arrives every ~5 s and ~20 ms after each command. In the startup capture it arri
 ## Report 0x05: info (Feature, read at startup) [CAP]
 `05 31 30 31 30 01 01 …` → ASCII "1010" (likely the firmware version).
 
-## Other report 0x06 commands [RE, meaning not confirmed]
-| cmd | data | hypothesis |
-|---|---|---|
-| 0x03 | len 1 | per-stage DPI colors? (RGB block built right after the DPI table) |
-| 0x05 | 1 byte: 1 if the profile field equals 1, otherwise 2 | lift-off distance (profile `LiftDetectionValue=02`) |
-| 0x06 | several bytes | ? |
-| 0x07, 0x08 | ? | lighting? |
-| 0x09 | 1 byte, raw profile value | angle snapping? (profile `AngleSnapValue=00`) |
-| 0x0F | ? | ? |
-| 0x10 / 0x11 | transfer in 25-byte chunks | macro upload — **do not use yet** |
+## Other report 0x06 commands [RE + HW]
+Recovered from `GamingMS.exe` v2.1.5 (installer `MSF-001 Pro Gaming Mouse V2.1.5.exe`, sha256 `a51e401d…e013df`) by static
+analysis only (REA 6.10.1 + Ghidra 12.2). The profile field each byte comes from was matched through the order of the profile
+key table (`GameFile0 … PowerDownTime, LiftDetectionHeight, KeyDebounce, MotionWakeup, AngleSnap, MotionSync, RippleControl`).
+All are single-part frames (`buf[3] = 0x01`), acked like the others. All of them were then confirmed on the user's mouse (TMouseOpen 0.4.0).
+
+| cmd | data (from `buf[5]`) | values offered by the official UI | source |
+|---|---|---|---|
+| 0x01 | 7 × 3 bytes, firmware order: left, right, middle, back, forward, DPI, slot 7 (always `40 03 00`). The UI's "Forward/Back" (keys 3/4) are swapped into this order | `10 01 00` left, `10 02 00` right, `10 04 00` middle, `10 08 00` back, `10 10 00` forward, `40 01 00` DPI loop (same table as the firmware default at image offset 0x82843b). At least one left click required | `0x00436d30` |
+| 0x03 | 8 × RGB (24 bytes), DPI stage LED colors | any color; defaults red, green, blue, cyan, yellow, magenta, white, white | `0x004370b0` |
+| 0x05 | `[mm]` lift-off distance | 1 or 2 | `0x004370b0` |
+| 0x06 | `[00] [effect] [(brightness+1)<<4 \| (speed+1)] [direction]` | effect 0 off, 1 colorful streaming, 2 breathing, 3 steady, 4 neon, 5 snake, 6 colorful steady, 7 wave (names from the status handler `0x00422050` + language table); speed 0–2 (3-position slider `0xc80`); brightness 0–3 (4-position slider `0xc94`); direction 0/1 | `0x004370b0` |
+| 0x07 | `[sleep minutes] [LED off while moving]` | 1–8 (8-position control labeled "power down time: N minutes"); 0/1 | `0x00438100` |
+| 0x08 | `[angle snap] [motion sync] [ripple control]` | 0/1 each; defaults 0, 1, 0 | `0x00438370` |
+| 0x09 | `[debounce ms]` | 0–30 (31-position slider `0xdca`, labeled "%dms"); default 2 | `0x004370b0` |
+| 0x0F | `[FF]` restore factory settings ("Restore" button, after a confirmation box) | — | `0x00439560` |
+| 0x10 / 0x11 | macros: 0x11 `[FF]` clears, 0x10 uploads 25-byte chunks | format not fully decoded — **not implemented** | `0x004359b0` |
+
+`MotionWakeup` is stored in the profile but no command sends it. Status byte 6 = current lighting effect (read by the
+official software in its status handler). Bit 7 of the DPI mask comes from an 8th checkbox in the official UI (unused here).
+Correction to an earlier guess: 0x09 is button debounce, not angle snapping (angle snap is in 0x08).
 
 ## Do not touch
 - Report **0xBF** (136 bytes, loop over 0x2B000 bytes in 128-byte chunks) and **0xBC**: firmware update. The executable embeds firmware images (offsets 0x800000 and 0x844000).

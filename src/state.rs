@@ -2,7 +2,7 @@
 //! (the official software also keeps this on the PC), so we store it here.
 //! The file is treated as untrusted input: size-limited and fully validated.
 
-use crate::protocol::{self as p, DpiConfig};
+use crate::protocol::{self as p, ButtonMap, DpiColors, DpiConfig, LightingConfig, PowerConfig, SensorConfig};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -22,6 +22,22 @@ pub fn set_home_override(home: Option<PathBuf>) {
 pub struct Saved {
     pub polling_hz: Option<u16>,
     pub dpi: Option<DpiConfig>,
+    // Settings below are stored only after the mouse acknowledged them
+    // (the mouse has no command to read them back).
+    #[serde(default)]
+    pub buttons: Option<ButtonMap>,
+    #[serde(default)]
+    pub dpi_colors: Option<DpiColors>,
+    #[serde(default)]
+    pub lift_off_mm: Option<u8>,
+    #[serde(default)]
+    pub lighting: Option<LightingConfig>,
+    #[serde(default)]
+    pub power: Option<PowerConfig>,
+    #[serde(default)]
+    pub sensor: Option<SensorConfig>,
+    #[serde(default)]
+    pub debounce_ms: Option<u8>,
 }
 
 fn config_base() -> Option<PathBuf> {
@@ -63,6 +79,21 @@ impl Saved {
         }
         if s.dpi.is_some_and(|d| d.validate().is_err()) {
             s.dpi = None;
+        }
+        if s.buttons.is_some_and(|b| b.validate().is_err()) {
+            s.buttons = None;
+        }
+        if s.lift_off_mm.is_some_and(|v| p::validate_lift_off(v).is_err()) {
+            s.lift_off_mm = None;
+        }
+        if s.lighting.is_some_and(|l| l.validate().is_err()) {
+            s.lighting = None;
+        }
+        if s.power.is_some_and(|pw| pw.validate().is_err()) {
+            s.power = None;
+        }
+        if s.debounce_ms.is_some_and(|v| p::validate_debounce(v).is_err()) {
+            s.debounce_ms = None;
         }
         s
     }

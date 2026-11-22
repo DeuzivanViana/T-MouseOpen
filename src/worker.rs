@@ -7,7 +7,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 pub enum Request {
-    Send(Command),
+    /// Commands sent in order; the batch stops at the first one the mouse does not acknowledge.
+    Send(Vec<Command>),
     Shutdown,
 }
 
@@ -127,7 +128,13 @@ impl Worker {
         loop {
             match self.rx.try_recv() {
                 Ok(Request::Shutdown) | Err(TryRecvError::Disconnected) => return Ok(()),
-                Ok(Request::Send(cmd)) => self.send(dev, cmd)?,
+                Ok(Request::Send(cmds)) => {
+                    for cmd in cmds {
+                        if !self.send(dev, cmd)? {
+                            break;
+                        }
+                    }
+                }
                 Err(TryRecvError::Empty) => {}
             }
             if let Some(data) = dev.read_input(200)? {
@@ -185,11 +192,10 @@ impl Worker {
         Ok(ack)
     }
 
-    fn send(&mut self, dev: &mut dyn Backend, cmd: Command) -> std::io::Result<()> {
-        let label = match &cmd {
-            Command::Polling(hz) => format!("polling {hz} Hz"),
-            Command::Dpi(_) => "DPI".to_string(),
-        };
+    /// Returns Ok(true) if the command was applied.
+    fn send(&mut self, dev: &mut dyn Backend, cmd: Command) -> std::io::Result<bool> {
+        let label = cmd.label();
+        self.emit(Event::Log(format!("sending {label} (command 0x{:02x})", cmd.code())));
         // Right after connecting the receiver may still be bringing up the 2.4G link.
         // Wait for the first status report before sending.
         if !self.link_up {
@@ -202,7 +208,7 @@ impl Worker {
             Ok(f) => f,
             Err(e) => {
                 self.emit(Event::Error(e.to_string()));
-                return Ok(());
+                return Ok(false);
             }
         };
         let mut out = Vec::new();
@@ -227,6 +233,12 @@ impl Worker {
                     let active = c.active;
                     Box::new(move |s| s.dpi_stage() == active)
                 }
+                Command::Lighting(l) => {
+                    let mode = l.mode;
+                    Box::new(move |s| s.lighting_mode() == mode)
+                }
+                // The status report carries no trace of the other settings: only the ack counts.
+                _ => Box::new(|_| false),
             };
             if self.watch_status(dev, VERIFY_WAIT, want)?.is_some() {
                 self.emit(Event::Log("no ack, but the status report confirms the change".into()));
@@ -234,7 +246,7 @@ impl Worker {
             }
         }
         self.emit(Event::Sent { label, frames: out, ok });
-        Ok(())
+        Ok(ok)
     }
 }
 

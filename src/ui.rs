@@ -1,7 +1,7 @@
 //! User interface (egui): dark monochrome theme, card layout with stat tiles,
 //! a segmented polling-rate control and a DPI stage list.
 
-use crate::protocol::{self as p, Command, DpiConfig, Status, DPI_STAGES};
+use crate::protocol::{self as p, ButtonAction, ButtonMap, Command, DpiColors, DpiConfig, LightingConfig, PowerConfig, SensorConfig, Status, DPI_STAGES};
 use crate::state::Saved;
 use crate::worker::{Event, Request, Worker};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Frame, Margin, Rect, RichText, Shadow, Stroke, StrokeKind, Vec2};
@@ -275,6 +275,36 @@ fn tile(ui: &mut egui::Ui, caption: &str, value: &str, unit: &str, add_sub: impl
 
 // ------------------------------------------------------------------ app
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Performance,
+    Buttons,
+    Sensor,
+    Lighting,
+    Device,
+}
+
+impl Tab {
+    const ALL: [Tab; 5] = [Tab::Performance, Tab::Buttons, Tab::Sensor, Tab::Lighting, Tab::Device];
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Performance => "Performance",
+            Tab::Buttons => "Buttons & LED",
+            Tab::Sensor => "Sensor & power",
+            Tab::Lighting => "Lighting",
+            Tab::Device => "Device",
+        }
+    }
+}
+
+/// Commands waiting for the user's OK before they are sent.
+struct Confirm {
+    title: String,
+    body: String,
+    cmds: Vec<Command>,
+    danger: bool,
+}
+
 enum Conn {
     Searching(String),
     Connected { name: String, version: String },
@@ -292,9 +322,20 @@ pub struct App {
     toast: Option<(String, Color32)>,
     log: VecDeque<String>,
     show_log: bool,
-    confirm_polling: Option<u16>,
+    confirm: Option<Confirm>,
+    /// First step of the factory-reset confirmation.
+    reset_armed: bool,
     first_status: bool,
-    pending: Option<Command>,
+    /// Commands sent to the worker and not answered yet, in order.
+    pending: VecDeque<Command>,
+    tab: Tab,
+    buttons: ButtonMap,
+    dpi_colors: DpiColors,
+    lift_off: u8,
+    debounce: u8,
+    lighting: LightingConfig,
+    power: PowerConfig,
+    sensor: SensorConfig,
     /// Natural heights measured on the previous frame (left column, right column).
     natural: (f32, f32),
     /// Height of the stat-tile row on the previous frame.
@@ -322,14 +363,23 @@ impl App {
             status: None,
             polling_choice: saved.polling_hz.unwrap_or(1000),
             dpi: saved.dpi.unwrap_or_default(),
+            buttons: saved.buttons.unwrap_or_default(),
+            dpi_colors: saved.dpi_colors.unwrap_or_default(),
+            lift_off: saved.lift_off_mm.unwrap_or(p::LIFT_OFF_DEFAULT_MM),
+            debounce: saved.debounce_ms.unwrap_or(p::DEBOUNCE_DEFAULT_MS),
+            lighting: saved.lighting.unwrap_or_default(),
+            power: saved.power.unwrap_or_default(),
+            sensor: saved.sensor.unwrap_or_default(),
+            tab: Tab::Performance,
             saved,
             busy: false,
             toast: None,
             log: VecDeque::new(),
             show_log: false,
-            confirm_polling: None,
+            confirm: None,
+            reset_armed: false,
             first_status: true,
-            pending: None,
+            pending: VecDeque::new(),
             natural: (0.0, 0.0),
             tiles_h: 0.0,
         };
@@ -366,6 +416,7 @@ impl App {
                     self.conn = Conn::Searching(format!("Disconnected: {msg}"));
                     self.status = None;
                     self.busy = false;
+                    self.pending.clear();
                 }
                 Event::Status(st) => {
                     if self.status.map(|s| s.raw) != Some(st.raw) {
@@ -385,24 +436,49 @@ impl App {
                 }
                 Event::Sent { label, frames, ok } => {
                     for (f, a) in &frames {
-                        self.push_log(format!("SET 06: {}", p::hex(&f[..23])));
+                        self.push_log(format!("SET 06: {}", p::hex(&f[..29])));
                         self.push_log(format!("ack 06: {}", p::hex(&a[..4])));
                     }
-                    self.busy = false;
+                    let cmd = self.pending.pop_front();
                     if ok {
                         self.toast = Some((format!("{label} applied"), OK));
-                        match self.pending.take() {
+                        match cmd {
                             Some(Command::Polling(hz)) => self.saved.polling_hz = Some(hz),
                             Some(Command::Dpi(c)) => self.saved.dpi = Some(c),
+                            Some(Command::Buttons(b)) => self.saved.buttons = Some(b),
+                            Some(Command::DpiColors(c)) => self.saved.dpi_colors = Some(c),
+                            Some(Command::LiftOff(mm)) => self.saved.lift_off_mm = Some(mm),
+                            Some(Command::Lighting(l)) => self.saved.lighting = Some(l),
+                            Some(Command::Power(pw)) => self.saved.power = Some(pw),
+                            Some(Command::Sensor(se)) => self.saved.sensor = Some(se),
+                            Some(Command::Debounce(ms)) => self.saved.debounce_ms = Some(ms),
+                            Some(Command::FactoryReset) => {
+                                // The mouse is back to its own defaults: forget what we stored.
+                                self.saved = Saved::default();
+                                self.dpi = DpiConfig::default();
+                                self.buttons = ButtonMap::default();
+                                self.dpi_colors = DpiColors::default();
+                                self.lift_off = p::LIFT_OFF_DEFAULT_MM;
+                                self.debounce = p::DEBOUNCE_DEFAULT_MS;
+                                self.lighting = LightingConfig::default();
+                                self.power = PowerConfig::default();
+                                self.sensor = SensorConfig::default();
+                                self.first_status = true;
+                            }
                             None => {}
                         }
                         self.saved.store();
                     } else {
                         self.toast = Some((format!("{label}: the mouse did not acknowledge"), BAD));
+                        // The worker stops a batch at the first failure.
+                        self.pending.clear();
                     }
+                    self.busy = !self.pending.is_empty();
                 }
                 Event::Log(s) => self.push_log(s),
                 Event::Error(s) => {
+                    // A rejected command also ends its batch.
+                    self.pending.clear();
                     self.busy = false;
                     self.toast = Some((s.clone(), BAD));
                     self.push_log(format!("error: {s}"));
@@ -411,11 +487,19 @@ impl App {
         }
     }
 
-    fn send(&mut self, cmd: Command) {
-        self.pending = Some(cmd.clone());
+    fn send(&mut self, cmds: Vec<Command>) {
+        if cmds.is_empty() {
+            return;
+        }
+        self.pending.extend(cmds.iter().cloned());
         self.busy = true;
         self.toast = None;
-        let _ = self.tx.send(Request::Send(cmd));
+        let _ = self.tx.send(Request::Send(cmds));
+    }
+
+    /// Sends commands straight away (every command has been verified on the mouse).
+    fn request(&mut self, cmds: Vec<Command>) {
+        self.send(cmds);
     }
 
     /// Connected and the mouse has reported its status at least once (2.4G link is up).
@@ -535,8 +619,7 @@ impl App {
                     let w = ((ui.available_width() - 3.0 * (n - 1.0)) / n).floor();
                     ui.horizontal(|ui| {
                         for (hz, _) in p::POLLING {
-                            let tested = p::POLLING_TESTED.contains(&hz);
-                            let label = if tested { format!("{hz}") } else { format!("{hz}*") };
+                            let label = format!("{hz}");
                             let sel = self.polling_choice == hz;
                             let btn = egui::Button::new(RichText::new(label).strong().color(if sel { ON_ACCENT } else { MUTED }))
                                 .fill(if sel { ACCENT } else { Color32::TRANSPARENT })
@@ -553,13 +636,8 @@ impl App {
             ui.horizontal(|ui| {
                 let enabled = self.ready() && !self.busy;
                 if ui.add_enabled(enabled, primary("Apply")).clicked() {
-                    if p::POLLING_TESTED.contains(&self.polling_choice) {
-                        self.send(Command::Polling(self.polling_choice));
-                    } else {
-                        self.confirm_polling = Some(self.polling_choice);
-                    }
+                    self.request(vec![Command::Polling(self.polling_choice)]);
                 }
-                ui.label(RichText::new("* not yet tested on your mouse").small().color(MUTED));
             });
         })
     }
@@ -641,7 +719,7 @@ impl App {
                 let enabled = self.ready() && !self.busy && sensor_ok == Some(true);
                 if ui.add_enabled(enabled, primary("Apply DPI")).clicked() {
                     match self.dpi.validate() {
-                        Ok(()) => self.send(Command::Dpi(self.dpi)),
+                        Ok(()) => self.request(vec![Command::Dpi(self.dpi)]),
                         Err(e) => self.toast = Some((e.to_string(), BAD)),
                     }
                 }
@@ -699,24 +777,36 @@ impl App {
     }
 
     fn confirm_modal(&mut self, ctx: &egui::Context) {
-        let Some(hz) = self.confirm_polling else { return };
+        let Some(c) = &self.confirm else { return };
+        let (title, body, danger) = (c.title.clone(), c.body.clone(), c.danger);
         let mut close = false;
-        egui::Modal::new(egui::Id::unique("confirm_polling"))
+        let mut go = false;
+        egui::Modal::new(egui::Id::unique("confirm_cmd"))
             .frame(card_frame().inner_margin(Margin::same(22)).stroke(Stroke::new(1.0, BORDER_HI)).corner_radius(CornerRadius::same(16)))
             .show(ctx, |ui| {
-                ui.set_width(340.0);
+                ui.set_width(380.0);
+                let col = if danger { BAD } else { WARN };
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 15.0, WARN.gamma_multiply(0.15));
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, "!", FontId::proportional(17.0), WARN);
-                    ui.label(RichText::new(format!("Apply {hz} Hz?")).heading().strong());
+                    ui.painter().circle_filled(r.center(), 15.0, col.gamma_multiply(0.15));
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, "!", FontId::proportional(17.0), col);
+                    ui.label(RichText::new(title).heading().strong());
                 });
                 ui.add_space(8.0);
-                ui.label(RichText::new("This value comes from the official software's code, but it has not been tested on your mouse yet.").color(MUTED));
+                ui.label(RichText::new(body).color(MUTED));
                 ui.add_space(16.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(primary("Apply")).clicked() {
-                        self.send(Command::Polling(hz));
+                    let label = if danger { "Restore" } else { "Apply" };
+                    let btn = if danger {
+                        egui::Button::new(RichText::new(label).color(Color32::WHITE).strong())
+                            .fill(BAD)
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(Vec2::new(96.0, 32.0))
+                    } else {
+                        primary(label)
+                    };
+                    if ui.add(btn).clicked() {
+                        go = true;
                         close = true;
                     }
                     if ui.add(secondary("Cancel")).clicked() {
@@ -725,9 +815,298 @@ impl App {
                 });
             });
         if close {
-            self.confirm_polling = None;
+            let c = self.confirm.take();
+            if go {
+                if let Some(c) = c {
+                    self.send(c.cmds);
+                }
+            }
         }
     }
+
+    // -------------------------------------------------------------- tabs
+
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        Frame::NONE
+            .fill(WELL)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(3))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                let n = Tab::ALL.len() as f32;
+                let w = ((ui.available_width() - 3.0 * (n - 1.0)) / n).floor();
+                ui.horizontal(|ui| {
+                    for t in Tab::ALL {
+                        let sel = self.tab == t;
+                        let btn = egui::Button::new(RichText::new(t.name()).strong().color(if sel { ON_ACCENT } else { MUTED }))
+                            .fill(if sel { ACCENT } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(Vec2::new(w, 30.0));
+                        if ui.add(btn).clicked() {
+                            self.tab = t;
+                            self.reset_armed = false;
+                        }
+                    }
+                });
+            });
+    }
+
+    fn can_send(&self) -> bool {
+        self.ready() && !self.busy
+    }
+
+    /// "Apply" + "Defaults" row used by the new cards. Returns (apply, defaults).
+    fn apply_row(&self, ui: &mut egui::Ui, apply_label: &str) -> (bool, bool) {
+        let mut out = (false, false);
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            out.0 = ui.add_enabled(self.can_send(), primary(apply_label)).clicked();
+            out.1 = ui.add(secondary("Defaults")).clicked();
+        });
+        out
+    }
+
+    fn labeled_toggle(ui: &mut egui::Ui, on: &mut bool, title: &str, help: &str) {
+        ui.horizontal(|ui| {
+            ui.set_min_height(40.0);
+            toggle(ui, on);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(RichText::new(title).color(TEXT));
+                ui.label(RichText::new(help).small().color(MUTED));
+            });
+        });
+    }
+
+    fn buttons_card(&mut self, ui: &mut egui::Ui, min_height: f32) -> f32 {
+        card(ui, "Button assignment", Some("command 0x01"), min_height, |ui| {
+            ui.label(RichText::new("Choose what each button does. At least one button must stay a left click.").small().color(MUTED));
+            ui.add_space(6.0);
+            egui::Grid::new("buttons").num_columns(2).spacing(Vec2::new(16.0, 8.0)).show(ui, |ui| {
+                for (i, name) in p::BUTTON_NAMES.iter().enumerate() {
+                    ui.label(RichText::new(*name).color(MUTED));
+                    let cur = &mut self.buttons.buttons[i];
+                    egui::ComboBox::from_id_salt(("btn", i))
+                        .selected_text(cur.name())
+                        .width(170.0)
+                        .show_ui(ui, |ui| {
+                            for a in ButtonAction::ALL {
+                                ui.selectable_value(cur, a, a.name());
+                            }
+                        });
+                    ui.end_row();
+                }
+            });
+            let valid = self.buttons.validate();
+            if let Err(e) = &valid {
+                ui.add_space(4.0);
+                ui.label(RichText::new(e.to_string()).small().color(BAD));
+            }
+            let (apply, defaults) = self.apply_row(ui, "Apply buttons");
+            if apply && valid.is_ok() {
+                self.request(vec![Command::Buttons(self.buttons)]);
+            }
+            if defaults {
+                self.buttons = ButtonMap::default();
+            }
+        })
+    }
+
+    fn colors_card(&mut self, ui: &mut egui::Ui, min_height: f32) -> f32 {
+        card(ui, "DPI stage LED colors", Some("command 0x03"), min_height, |ui| {
+            ui.label(RichText::new("Color the DPI indicator shows for each stage (if your mouse has one).").small().color(MUTED));
+            ui.add_space(6.0);
+            egui::Grid::new("colors").num_columns(4).spacing(Vec2::new(14.0, 10.0)).show(ui, |ui| {
+                for i in 0..8 {
+                    ui.horizontal(|ui| {
+                        let active = self.status.map(|s| s.dpi_stage() as usize == i).unwrap_or(false);
+                        stage_badge(ui, i + 1, active, false);
+                        ui.color_edit_button_srgb(&mut self.dpi_colors.colors[i]);
+                    });
+                    if i % 4 == 3 {
+                        ui.end_row();
+                    }
+                }
+            });
+            let (apply, defaults) = self.apply_row(ui, "Apply colors");
+            if apply {
+                self.request(vec![Command::DpiColors(self.dpi_colors)]);
+            }
+            if defaults {
+                self.dpi_colors = DpiColors::default();
+            }
+        })
+    }
+
+    fn sensor_card(&mut self, ui: &mut egui::Ui, min_height: f32) -> f32 {
+        card(ui, "Sensor", Some("commands 0x08 · 0x05"), min_height, |ui| {
+            Self::labeled_toggle(ui, &mut self.sensor.angle_snap, "Angle snap", "Straightens slightly curved horizontal and vertical movements.");
+            Self::labeled_toggle(ui, &mut self.sensor.motion_sync, "Motion sync", "Aligns sensor reads with USB polling for steadier tracking.");
+            Self::labeled_toggle(ui, &mut self.sensor.ripple_control, "Ripple control", "Smooths jitter at high DPI, at the cost of a little latency.");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Lift-off distance").color(TEXT));
+            ui.label(RichText::new("Height at which the sensor stops tracking when you lift the mouse.").small().color(MUTED));
+            ui.add_space(4.0);
+            segmented(ui, "lod", &mut self.lift_off, &[(1, "1 mm"), (2, "2 mm")]);
+            let (apply, defaults) = self.apply_row(ui, "Apply sensor");
+            if apply {
+                self.request(vec![Command::Sensor(self.sensor), Command::LiftOff(self.lift_off)]);
+            }
+            if defaults {
+                self.sensor = SensorConfig::default();
+                self.lift_off = p::LIFT_OFF_DEFAULT_MM;
+            }
+        })
+    }
+
+    fn power_card(&mut self, ui: &mut egui::Ui, min_height: f32) -> f32 {
+        card(ui, "Power & buttons", Some("commands 0x07 · 0x09"), min_height, |ui| {
+            ui.label(RichText::new("Sleep after").color(TEXT));
+            ui.label(RichText::new("Minutes without movement before the mouse goes to sleep.").small().color(MUTED));
+            ui.add_space(4.0);
+            ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(120.0);
+            ui.add(egui::Slider::new(&mut self.power.sleep_minutes, 1..=p::SLEEP_MAX_MIN).suffix(" min"));
+            ui.add_space(4.0);
+            Self::labeled_toggle(ui, &mut self.power.led_off_while_moving, "LED off while moving", "Turns the lighting off while the mouse is in use to save battery.");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Button debounce").color(TEXT));
+            ui.label(RichText::new("Ignores repeated contacts within this time. Raise it if you get double clicks.").small().color(MUTED));
+            ui.add_space(4.0);
+            ui.add(egui::Slider::new(&mut self.debounce, 0..=p::DEBOUNCE_MAX_MS).suffix(" ms"));
+            let (apply, defaults) = self.apply_row(ui, "Apply power");
+            if apply {
+                self.request(vec![Command::Power(self.power), Command::Debounce(self.debounce)]);
+            }
+            if defaults {
+                self.power = PowerConfig::default();
+                self.debounce = p::DEBOUNCE_DEFAULT_MS;
+            }
+        })
+    }
+
+    fn lighting_card(&mut self, ui: &mut egui::Ui, min_height: f32) -> f32 {
+        let current = self.status.map(|s| s.lighting_mode());
+        let hint = current.map(|m| format!("now: {}", p::lighting_mode_name(m).unwrap_or("unknown")));
+        card(ui, "Lighting effect", hint.as_deref(), min_height, |ui| {
+            ui.label(RichText::new("Effect, speed and brightness of the mouse lighting (if your mouse has RGB).").small().color(MUTED));
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                for (code, name) in p::LIGHTING_MODES {
+                    let sel = self.lighting.mode == code;
+                    let btn = egui::Button::new(RichText::new(name).color(if sel { ON_ACCENT } else { TEXT }))
+                        .fill(if sel { ACCENT } else { CARD_HI })
+                        .stroke(Stroke::new(1.0, if sel { ACCENT } else { BORDER }))
+                        .corner_radius(CornerRadius::same(16))
+                        .min_size(Vec2::new(0.0, 30.0));
+                    if ui.add(btn).clicked() {
+                        self.lighting.mode = code;
+                    }
+                }
+            });
+            ui.add_space(12.0);
+            let off = self.lighting.mode == 0;
+            ui.add_enabled_ui(!off, |ui| {
+                egui::Grid::new("light").num_columns(2).spacing(Vec2::new(16.0, 10.0)).show(ui, |ui| {
+                    ui.label(RichText::new("Speed").color(MUTED));
+                    segmented(ui, "speed", &mut self.lighting.speed, &[(0, "Slow"), (1, "Medium"), (2, "Fast")]);
+                    ui.end_row();
+                    ui.label(RichText::new("Brightness").color(MUTED));
+                    segmented(ui, "bright", &mut self.lighting.brightness, &[(0, "1"), (1, "2"), (2, "3"), (3, "4")]);
+                    ui.end_row();
+                    ui.label(RichText::new("Direction").color(MUTED));
+                    segmented(ui, "dir", &mut self.lighting.direction, &[(0, "Forward"), (1, "Reverse")]);
+                    ui.end_row();
+                });
+            });
+            let (apply, defaults) = self.apply_row(ui, "Apply lighting");
+            if apply {
+                self.request(vec![Command::Lighting(self.lighting)]);
+            }
+            if defaults {
+                self.lighting = LightingConfig::default();
+            }
+        })
+    }
+
+    fn reset_card(&mut self, ui: &mut egui::Ui, min_height: f32) -> f32 {
+        card(ui, "Restore factory settings", Some("command 0x0F"), min_height, |ui| {
+            ui.label(RichText::new("Puts every setting stored in the mouse back to its factory value: DPI, polling rate, buttons, lighting and power. The values saved by this app are cleared too.").color(MUTED));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Firmware update and receiver pairing are not available in this app on purpose.").small().color(FAINT));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let danger = egui::Button::new(RichText::new("Restore factory settings…").color(BAD).strong())
+                    .fill(BAD.gamma_multiply(0.10))
+                    .stroke(Stroke::new(1.0, BAD.gamma_multiply(0.5)))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(0.0, 32.0));
+                if ui.add_enabled(self.can_send(), danger).clicked() {
+                    self.reset_armed = true;
+                }
+                if self.reset_armed {
+                    if ui.add(secondary("Cancel")).clicked() {
+                        self.reset_armed = false;
+                    }
+                }
+            });
+            if self.reset_armed {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Step 1 of 2: are you sure? This cannot be undone from the app.").color(WARN));
+                    if ui.add_enabled(self.can_send(), secondary("Yes, continue")).clicked() {
+                        self.reset_armed = false;
+                        self.confirm = Some(Confirm {
+                            title: "Restore factory settings?".into(),
+                            body: "Step 2 of 2. The mouse will forget all custom settings and go back to its factory values.".into(),
+                            cmds: vec![Command::FactoryReset],
+                            danger: true,
+                        });
+                    }
+                });
+            }
+        })
+    }
+
+    /// Two cards side by side with equal height; returns nothing (heights cached in `natural`).
+    fn two_columns(&mut self, ui: &mut egui::Ui, col_h: f32, left: fn(&mut Self, &mut egui::Ui, f32) -> f32, right: fn(&mut Self, &mut egui::Ui, f32) -> f32) {
+        ui.spacing_mut().item_spacing.x = GAP;
+        ui.columns_const(|[l, r]| {
+            let a = left(self, l, col_h);
+            let b = right(self, r, col_h);
+            self.natural = (a, b);
+        });
+    }
+}
+
+/// Segmented control over a small set of values.
+fn segmented(ui: &mut egui::Ui, id: &str, value: &mut u8, options: &[(u8, &str)]) {
+    Frame::NONE
+        .fill(WELL)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.push_id(id, |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.horizontal(|ui| {
+                    for (v, name) in options {
+                        let sel = *value == *v;
+                        let btn = egui::Button::new(RichText::new(*name).strong().color(if sel { ON_ACCENT } else { MUTED }))
+                            .fill(if sel { ACCENT } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(Vec2::new(64.0, 28.0));
+                        if ui.add(btn).clicked() {
+                            *value = *v;
+                        }
+                    }
+                });
+            });
+        });
 }
 
 impl eframe::App for App {
@@ -755,18 +1134,29 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let top = ui.cursor().top();
                     self.tiles(ui);
+                    ui.add_space(GAP - ui.spacing().item_spacing.y);
+                    self.tab_bar(ui);
                     self.tiles_h = ui.cursor().top() - top - ui.spacing().item_spacing.y;
                     ui.add_space(GAP - ui.spacing().item_spacing.y);
-                    // add_space() is followed by the regular item spacing before the next widget.
                     let gap = GAP;
-                    ui.spacing_mut().item_spacing.x = GAP;
-                    ui.columns_const(|[left, right]| {
-                        let poll_h = self.polling_card(left, 0.0);
-                        left.add_space(gap - left.spacing().item_spacing.y);
-                        let dev_nat = self.device_card(left, col_h - poll_h - gap);
-                        let dpi_nat = self.dpi_card(right, col_h);
-                        self.natural = (poll_h + gap + dev_nat, dpi_nat);
-                    });
+                    match self.tab {
+                        Tab::Performance => {
+                            ui.spacing_mut().item_spacing.x = GAP;
+                            ui.columns_const(|[left, right]| {
+                                let poll_h = self.polling_card(left, 0.0);
+                                left.add_space(gap - left.spacing().item_spacing.y);
+                                let dev_nat = self.device_card(left, col_h - poll_h - gap);
+                                let dpi_nat = self.dpi_card(right, col_h);
+                                self.natural = (poll_h + gap + dev_nat, dpi_nat);
+                            });
+                        }
+                        Tab::Buttons => self.two_columns(ui, col_h, Self::buttons_card, Self::colors_card),
+                        Tab::Sensor => self.two_columns(ui, col_h, Self::sensor_card, Self::power_card),
+                        Tab::Lighting => {
+                            self.natural = (self.lighting_card(ui, col_h), 0.0);
+                        }
+                        Tab::Device => self.two_columns(ui, col_h, Self::device_card, Self::reset_card),
+                    }
                 });
             });
 

@@ -182,8 +182,9 @@ impl Backend for Hidraw {
     }
 
     fn set_feature(&mut self, frame: &[u8; REPORT_LEN]) -> io::Result<()> {
-        if frame[0] != p::CMD_REPORT_ID {
-            // Defense in depth: this program only ever writes the command report.
+        if frame[0] != p::CMD_REPORT_ID || !p::ALLOWED_COMMANDS.contains(&frame[1]) {
+            // Defense in depth: this program only ever writes the command report,
+            // and only the configuration commands listed in protocol.rs.
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "report not allowed"));
         }
         let mut buf = *frame;
@@ -239,7 +240,7 @@ pub struct Demo {
 impl Demo {
     pub fn new() -> Self {
         Self {
-            status: [0x04, 0x01, 0x01, 0x02, 0x1e, 0x00, 0x00, 0x00, 0x02, 0x11],
+            status: [0x04, 0x01, 0x01, 0x02, 0x1e, 0x00, 0x01, 0x00, 0x02, 0x11],
             pending: Some(std::time::Instant::now()),
             last_periodic: std::time::Instant::now(),
         }
@@ -254,6 +255,7 @@ impl Backend for Demo {
         match f[1] {
             0x04 => self.status[3] = f[5],
             0x02 => self.status[2] = f[5],
+            0x06 => self.status[6] = f[6],
             _ => {}
         }
         self.pending = Some(std::time::Instant::now());
