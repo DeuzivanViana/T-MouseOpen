@@ -3,7 +3,30 @@
 Linux configurator for the **Titorion YDX-GM009** mouse (2.4G receiver `04f3:026f`, PAW3311 sensor).
 Shows polling rate, active DPI stage, battery, charge state and sensor; changes the polling rate and the 7 DPI stages.
 
-![screenshot](docs/screenshot.png)
+![TMouseOpen main window](docs/screenshot.png)
+
+| Settings applied, log open | Confirming an untested polling rate | No receiver connected |
+|---|---|---|
+| ![applied](docs/screenshot-applied.png) | ![confirm](docs/screenshot-confirm.png) | ![no receiver](docs/screenshot-no-receiver.png) |
+
+*Screenshots taken with `--demo` (simulated mouse) on Xvfb; no hardware was touched.*
+
+## Interface
+- **Stat tiles** at the top: polling rate (with the receiver's maximum), active DPI and stage, battery level and charge state, sensor and firmware.
+- **Polling rate**: segmented control (125 / 250 / 500 / 1000 Hz). Values marked `*` have not been tested on the mouse yet and ask for confirmation before being sent.
+- **DPI stages**: one row per stage with an on/off switch, a numbered badge (click it to make that stage active), the DPI picker and a bar showing the value relative to the 12000 DPI maximum. Nothing is sent until you press **Apply DPI**.
+- **Device** card: receiver, sensor, firmware and maximum rate; when the mouse is not connected it shows the last applied polling rate.
+- **Status bar**: connection pill in the header, result of the last command in the footer and a collapsible log with every frame sent and acknowledged.
+
+## Prebuilt binary (Debian 11, 12, 13)
+Download `tmouseopen-<version>-linux-x86_64.tar.gz`, then:
+```bash
+tar xzf tmouseopen-*-linux-x86_64.tar.gz
+cd tmouseopen-*-linux-x86_64
+./tmouseopen --demo      # try the UI without the mouse
+```
+The binary needs glibc 2.30 or newer (Debian 11 ships 2.31) and no extra packages beyond a normal desktop.
+See **Permissions** below to access the receiver.
 
 ## Build (Debian/Ubuntu)
 
@@ -12,6 +35,13 @@ sudo apt install build-essential curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust >= 1.95 (the apt rustc is too old)
 cargo build --release
 # binary: target/release/tmouseopen
+```
+
+To build a binary that also runs on older distributions (glibc 2.31, Debian 11), use [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild):
+```bash
+pip install ziglang && cargo install cargo-zigbuild
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
+# binary: target/x86_64-unknown-linux-gnu/release/tmouseopen
 ```
 
 Rust crates (fetched by cargo): `eframe`/`egui` 0.37 (UI), `libc` (hidraw ioctls), `serde` + `serde_json` (saved settings).
@@ -76,5 +106,5 @@ version (`~/.config/ydx-mouse/`) are picked up automatically.
 | `src/worker.rs` | device thread: sends commands, waits for acks, reads status, reconnects |
 | `src/state.rs` | saved settings |
 | `src/privs.rs` | `sudo -E` support: open the receiver, then drop root |
-| `src/ui.rs` | egui UI (dark theme) |
+| `src/ui.rs` | egui UI (dark monochrome theme, stat tiles, segmented control, DPI stage list) |
 | `PROTOCOL.md` | what is known about the protocol, with confidence levels |

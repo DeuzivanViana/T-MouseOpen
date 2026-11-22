@@ -48,8 +48,8 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("TMouseOpen")
             .with_app_id("tmouseopen")
-            .with_inner_size([900.0, 660.0])
-            .with_min_inner_size([780.0, 560.0]),
+            .with_inner_size([960.0, 700.0])
+            .with_min_inner_size([820.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native("TMouseOpen", options, Box::new(move |cc| Ok(Box::new(ui::App::new(cc, demo, initial, sudo_mode, note)))))
